@@ -70,3 +70,4 @@ No rebuild needed — restart the Next.js dev server after changing the env var.
 | `NEXT_PUBLIC_BACKEND_URL` | frontend      | `http://localhost:4000`  |
 | `PORT`                    | both backends | `4000`                   |
 | `CORS_ORIGIN`             | both backends | `*`                      |
+# Socket-Chat-App
