@@ -8,25 +8,9 @@ import (
 	"sync"
 	"time"
 
-	socketio "github.com/googollee/go-socket.io"
-	"github.com/googollee/go-socket.io/engineio"
-	"github.com/googollee/go-socket.io/engineio/transport"
-	"github.com/googollee/go-socket.io/engineio/transport/polling"
-	"github.com/googollee/go-socket.io/engineio/transport/websocket"
+	"github.com/zishang520/socket.io/v2/socket"
 )
 
-// ── Payloads — match the Node.js backend exactly ──
-
-type JoinLeaveRequest struct {
-	Username string `json:"username"`
-	Room     string `json:"room"`
-}
-
-type MessageRequest struct {
-	Username string `json:"username"`
-	Message  string `json:"message"`
-	Room     string `json:"room"`
-}
 
 type ChatPayload struct {
 	Username  string `json:"username"`
@@ -42,8 +26,7 @@ type connState struct {
 }
 
 var (
-	connStates = make(map[string]*connState)
-	mu         sync.Mutex
+	connStates sync.Map // key: socket.SocketId → *connState
 )
 
 func getEnv(key, fallback string) string {
@@ -57,137 +40,139 @@ func main() {
 	port := getEnv("PORT", "4000")
 	corsOrigin := getEnv("CORS_ORIGIN", "*")
 
-	server := socketio.NewServer(&engineio.Options{
-		Transports: []transport.Transport{
-			&polling.Transport{},
-			&websocket.Transport{},
-		},
+	io := socket.NewServer(nil, nil)
+
+	io.On("connection", func(args ...any) {
+		client := args[0].(*socket.Socket)
+		connStates.Store(client.Id(), &connState{})
+		log.Printf("[connect] %s\n", client.Id())
+
+		client.On("join", func(datas ...any) {
+			data := toStringMap(datas)
+			username, _ := data["username"].(string)
+			room, _ := data["room"].(string)
+			if username == "" || room == "" {
+				return
+			}
+
+			// Leave previous room if any
+			if prev, ok := connStates.Load(client.Id()); ok {
+				st := prev.(*connState)
+				if st.room != "" {
+					performLeave(io, client, st)
+				}
+			}
+
+			connStates.Store(client.Id(), &connState{username: username, room: room})
+			client.Join(socket.Room(room))
+
+			payload := ChatPayload{
+				Username:  username,
+				Message:   fmt.Sprintf("%s has joined the room", username),
+				Room:      room,
+				Timestamp: time.Now().UnixMilli(),
+			}
+			io.To(socket.Room(room)).Emit("join", payload)
+			log.Printf("[join] %s → #%s\n", username, room)
+		})
+
+		client.On("message", func(datas ...any) {
+			data := toStringMap(datas)
+			username, _ := data["username"].(string)
+			message, _ := data["message"].(string)
+			room, _ := data["room"].(string)
+			if username == "" || room == "" {
+				return
+			}
+
+			payload := ChatPayload{
+				Username:  username,
+				Message:   message,
+				Room:      room,
+				Timestamp: time.Now().UnixMilli(),
+			}
+			io.To(socket.Room(room)).Emit("message", payload)
+		})
+
+		client.On("leave", func(datas ...any) {
+			if prev, ok := connStates.Load(client.Id()); ok {
+				st := prev.(*connState)
+				if st.room != "" {
+					performLeave(io, client, st)
+					connStates.Store(client.Id(), &connState{})
+				}
+			}
+		})
+
+		client.On("disconnect", func(datas ...any) {
+			if prev, ok := connStates.Load(client.Id()); ok {
+				st := prev.(*connState)
+				if st.room != "" {
+					performLeave(io, client, st)
+				}
+			}
+			connStates.Delete(client.Id())
+			log.Printf("[disconnect] %s\n", client.Id())
+		})
 	})
 
-	server.OnConnect("/", func(s socketio.Conn) error {
-		log.Printf("[connect] %s\n", s.ID())
-		mu.Lock()
-		connStates[s.ID()] = &connState{}
-		mu.Unlock()
-		return nil
-	})
-
-	server.OnEvent("/", "join", func(s socketio.Conn, data JoinLeaveRequest) {
-		mu.Lock()
-		state := connStates[s.ID()]
-		if state != nil && state.room != "" {
-			doLeave(s, state, server)
-		}
-		if state == nil {
-			state = &connState{}
-			connStates[s.ID()] = state
-		}
-		state.username = data.Username
-		state.room = data.Room
-		mu.Unlock()
-
-		s.Join(data.Room)
-
-		payload := ChatPayload{
-			Username:  data.Username,
-			Message:   fmt.Sprintf("%s has joined the room", data.Username),
-			Room:      data.Room,
-			Timestamp: time.Now().UnixMilli(),
-		}
-		server.BroadcastToRoom("/", data.Room, "join", payload)
-		log.Printf("[join] %s → #%s\n", data.Username, data.Room)
-	})
-
-	server.OnEvent("/", "message", func(s socketio.Conn, data MessageRequest) {
-		payload := ChatPayload{
-			Username:  data.Username,
-			Message:   data.Message,
-			Room:      data.Room,
-			Timestamp: time.Now().UnixMilli(),
-		}
-		server.BroadcastToRoom("/", data.Room, "message", payload)
-	})
-
-	server.OnEvent("/", "leave", func(s socketio.Conn, data JoinLeaveRequest) {
-		mu.Lock()
-		state := connStates[s.ID()]
-		if state != nil && state.room != "" {
-			doLeave(s, state, server)
-			state.username = ""
-			state.room = ""
-		}
-		mu.Unlock()
-	})
-
-	server.OnDisconnect("/", func(s socketio.Conn, reason string) {
-		mu.Lock()
-		state := connStates[s.ID()]
-		if state != nil && state.room != "" {
-			doLeave(s, state, server)
-		}
-		delete(connStates, s.ID())
-		mu.Unlock()
-		log.Printf("[disconnect] %s (%s)\n", s.ID(), reason)
-	})
-
-	server.OnError("/", func(s socketio.Conn, e error) {
-		log.Printf("[error] %v\n", e)
-	})
-
-	go func() {
-		if err := server.Serve(); err != nil {
-			log.Fatalf("socket.io serve error: %v\n", err)
-		}
-	}()
-	defer server.Close()
-
-	// ── HTTP routes ──
+	// ── HTTP mux ──
 	mux := http.NewServeMux()
 
+	// Health check
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" {
-			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`{"status":"ok","server":"go"}`))
+		setCORSHeaders(w, corsOrigin)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
 			return
 		}
-		http.NotFound(w, r)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":"ok","server":"go"}`))
 	})
 
-	mux.Handle("/socket.io/", server)
-
-	handler := corsMiddleware(mux, corsOrigin)
+	// Socket.IO handler — CORS headers added before delegating
+	socketHandler := io.ServeHandler(nil)
+	mux.HandleFunc("/socket.io/", func(w http.ResponseWriter, r *http.Request) {
+		setCORSHeaders(w, corsOrigin)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		socketHandler.ServeHTTP(w, r)
+	})
 
 	log.Printf("Go chat backend running on http://localhost:%s\n", port)
-	if err := http.ListenAndServe(":"+port, handler); err != nil {
+	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatal(err)
 	}
 }
 
-// doLeave broadcasts leave event and removes from room. Must be called with mu held.
-func doLeave(s socketio.Conn, state *connState, server *socketio.Server) {
+func performLeave(io *socket.Server, client *socket.Socket, st *connState) {
 	payload := ChatPayload{
-		Username:  state.username,
-		Message:   fmt.Sprintf("%s has left the room", state.username),
-		Room:      state.room,
+		Username:  st.username,
+		Message:   fmt.Sprintf("%s has left the room", st.username),
+		Room:      st.room,
 		Timestamp: time.Now().UnixMilli(),
 	}
-	server.BroadcastToRoom("/", state.room, "leave", payload)
-	s.Leave(state.room)
-	log.Printf("[leave] %s ← #%s\n", state.username, state.room)
+	io.To(socket.Room(st.room)).Emit("leave", payload)
+	client.Leave(socket.Room(st.room))
+	log.Printf("[leave] %s ← #%s\n", st.username, st.room)
 }
 
-func corsMiddleware(next http.Handler, origin string) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", origin)
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+// toStringMap safely coerces the first vararg into a map[string]any.
+func toStringMap(datas []any) map[string]any {
+	if len(datas) == 0 {
+		return nil
+	}
+	if m, ok := datas[0].(map[string]any); ok {
+		return m
+	}
+	return nil
+}
 
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
+func setCORSHeaders(w http.ResponseWriter, origin string) {
+	w.Header().Set("Access-Control-Allow-Origin", origin)
+	w.Header().Set("Access-Control-Allow-Credentials", "true")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 }
